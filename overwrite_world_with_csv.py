@@ -25,31 +25,58 @@ from deephedging.base import tf_dict, DIM_DUMMY
 import deephedging.base as base
 
 def load_csv_data(csv_path):
-    """Load and validate CSV data."""
+    """Load and validate CSV data with STRIPE-based structure."""
     df = pd.read_csv(csv_path)
     
+    # Map column names to standard names (case insensitive)
+    column_mapping = {}
+    for col in df.columns:
+        col_lower = col.lower()
+        if 'stripe' in col_lower:
+            column_mapping[col] = 'stripe'
+        elif 'strike' in col_lower:
+            column_mapping[col] = 'strike'
+        elif 'price' in col_lower and 'strike' not in col_lower:
+            column_mapping[col] = 'price'
+        elif 'volatility' in col_lower or 'ivol' in col_lower:
+            column_mapping[col] = 'ivol'
+        elif 'time' in col_lower and 'maturity' in col_lower:
+            column_mapping[col] = 'time_left'
+        elif col_lower in ['time_left', 'time_to_maturity']:
+            column_mapping[col] = 'time_left'
+    
+    # Rename columns
+    df = df.rename(columns=column_mapping)
+    
     # Check required columns
-    required_cols = ['strike', 'price', 'ivol', 'time_left']
+    required_cols = ['stripe', 'strike', 'price', 'ivol', 'time_left']
     missing_cols = [col for col in required_cols if col not in df.columns]
     if missing_cols:
-        raise ValueError(f"Missing required columns: {missing_cols}")
+        available_cols = list(df.columns)
+        raise ValueError(f"Missing required columns: {missing_cols}. Available columns: {available_cols}")
     
-    # Add spot if missing (use first strike as proxy)
-    if 'spot' not in df.columns:
-        df['spot'] = df['strike'].iloc[0]
-        print(f"Warning: 'spot' column missing, using {df['spot'].iloc[0]} as spot price")
+    # Keep only required columns
+    df = df[required_cols].copy()
     
-    # Calculate missing Greeks
-    if 'delta' not in df.columns:
-        df['delta'] = calculate_bs_delta(df['spot'], df['strike'], df['time_left'], df['ivol'])
+    # Sort by stripe and time_left (descending)
+    df = df.sort_values(['stripe', 'time_left'], ascending=[True, False])
     
-    if 'vega' not in df.columns:
-        df['vega'] = calculate_bs_vega(df['spot'], df['strike'], df['time_left'], df['ivol'])
+    # Add spot column
+    df['spot'] = df['price']
+    
     
     print(f"Loaded CSV data: {len(df)} rows")
-    print(f"Columns: {list(df.columns)}")
-    print(f"Time range: {df['time_left'].min()} to {df['time_left'].max()}")
-    print(f"Strike range: {df['strike'].min()} to {df['strike'].max()}")
+    print(f"Number of stripes (paths): {df['stripe'].nunique()}")
+    print(f"Time steps per stripe:")
+    for stripe in df['stripe'].unique()[:5]:  # Show first 5 stripes
+        stripe_data = df[df['stripe'] == stripe]
+        print(f"  {stripe}: {len(stripe_data)} steps, strike={stripe_data['strike'].iloc[0]}, time range={stripe_data['time_left'].max()}-{stripe_data['time_left'].min()}")
+    
+    # Check that each stripe has the same strike throughout
+    strike_consistency = df.groupby('stripe')['strike'].nunique()
+    inconsistent_stripes = strike_consistency[strike_consistency > 1]
+    if len(inconsistent_stripes) > 0:
+        print(f"Warning: {len(inconsistent_stripes)} stripes have inconsistent strikes")
     
     return df
 
@@ -119,44 +146,56 @@ def overwrite_world_with_csv(val_world, csv_path,
     # Load CSV data
     df = load_csv_data(csv_path)
     
-    # Sort by time_left (descending) and strike
-    df = df.sort_values(['time_left', 'strike'], ascending=[False, True])
+    # Get unique stripes (each stripe is a sample/path)
+    unique_stripes = df['stripe'].unique()
+    nSamples = len(unique_stripes)
     
-    # Determine dimensions
-    unique_times = sorted(df['time_left'].unique(), reverse=True)
+    # Get time steps from first stripe
+    first_stripe_data = df[df['stripe'] == unique_stripes[0]].sort_values('time_left', ascending=False)
+    unique_times = first_stripe_data['time_left'].values
     nSteps = len(unique_times)
-    
-    # Group by time and get number of strikes at each time
-    strikes_per_time = df.groupby('time_left')['strike'].nunique()
-    nSamples = strikes_per_time.iloc[0] if len(strikes_per_time) > 0 else len(df)
-    nInst = 2  # spot + option
+    nInst = 1  # only spot
     
     print(f"New dimensions: nSamples={nSamples}, nSteps={nSteps}, nInst={nInst}")
+    print(f"Time steps: {unique_times}")
     
     # Initialize arrays
     spot_path = np.zeros((nSamples, nSteps + 1), dtype=val_world.np_dtype)
-    option_prices = np.zeros((nSamples, nSteps), dtype=val_world.np_dtype)
-    option_deltas = np.zeros((nSamples, nSteps), dtype=val_world.np_dtype)
-    option_vegas = np.zeros((nSamples, nSteps), dtype=val_world.np_dtype)
-    strikes = np.zeros(nSamples, dtype=val_world.np_dtype)
     ivols = np.zeros((nSamples, nSteps), dtype=val_world.np_dtype)
+    time_left = np.zeros((nSamples, nSteps), dtype=val_world.np_dtype)
+    spot_path[:, 0] = df['spot'].values
+
     
-    # Fill arrays with CSV data
-    for t_idx, time_left in enumerate(unique_times):
-        time_data = df[df['time_left'] == time_left].head(nSamples)
+    # Fill arrays with CSV data - each stripe becomes one sample
+    for sample_idx, stripe in enumerate(unique_stripes):
+        stripe_data = df[df['stripe'] == stripe].sort_values('time_left', ascending=False)
         
-        # Pad with last row if needed
-        while len(time_data) < nSamples:
-            time_data = pd.concat([time_data, time_data.iloc[-1:]], ignore_index=True)
+        # Ensure we have the expected number of time steps
+        if len(stripe_data) != nSteps:
+            print(f"Warning: Stripe {stripe} has {len(stripe_data)} time steps, expected {nSteps}")
+            # Pad or truncate as needed
+            if len(stripe_data) < nSteps:
+                # Pad with last row
+                last_row = stripe_data.iloc[-1:].copy()
+                while len(stripe_data) < nSteps:
+                    stripe_data = pd.concat([stripe_data, last_row], ignore_index=True)
+            else:
+                # Truncate
+                stripe_data = stripe_data.head(nSteps)
         
-        if t_idx == 0:  # First time step
-            spot_path[:, t_idx] = time_data['spot'].values[:nSamples]
-            strikes[:] = time_data['strike'].values[:nSamples]
+        # Fill arrays for this sample
+        strikes[sample_idx] = stripe_data['strike'].iloc[0]  # Strike should be same throughout
+        spot_path[sample_idx, 0] = stripe_data['spot'].iloc[0]  # Initial spot
         
-        option_prices[:, t_idx] = time_data['price'].values[:nSamples]
-        option_deltas[:, t_idx] = time_data['delta'].values[:nSamples]
-        option_vegas[:, t_idx] = time_data['vega'].values[:nSamples]
-        ivols[:, t_idx] = time_data['ivol'].values[:nSamples]
+        # Fill time series data
+        for t_idx in range(nSteps):
+            if t_idx < len(stripe_data):
+                ivols[sample_idx, t_idx] = stripe_data['ivol'].iloc[t_idx]
+                time_left[sample_idx, t_idx] = stripe_data['time_left'].iloc[t_idx]
+            else:
+                # Use last available values if data is shorter
+                ivols[sample_idx, t_idx] = ivols[sample_idx, t_idx-1]
+                time_left[sample_idx, t_idx] = time_left[sample_idx, t_idx-1]
     
     # Complete spot path (assume constant for simplicity)
     for t in range(1, nSteps + 1):
@@ -174,31 +213,24 @@ def overwrite_world_with_csv(val_world, csv_path,
     # For spot: returns are the difference between final spot and current spot
     spot_returns = spot_path[:, nSteps][:, np.newaxis] - spot_path[:, :nSteps]
     
-    # For options: returns are the difference between final payoff and current price
-    option_returns = payoff[:, np.newaxis] - option_prices
     
     # Combine hedges
     hedges = np.zeros((nSamples, nSteps, nInst), dtype=val_world.np_dtype)
     hedges[:, :, 0] = spot_returns  # Spot
-    hedges[:, :, 1] = option_returns  # Option
     
     # Calculate costs
     cost_spot = spot_path[:, :nSteps] * cost_s
-    cost_option = (cost_v * np.abs(option_vegas) + 
-                   cost_s * np.abs(option_deltas) + 
-                   cost_p * np.abs(option_prices))
     
     cost = np.zeros((nSamples, nSteps, nInst), dtype=val_world.np_dtype)
     cost[:, :, 0] = cost_spot
-    cost[:, :, 1] = cost_option
     
     # Action bounds (copy from original world structure)
     ubnd_a = np.zeros((nSamples, nSteps, nInst), dtype=val_world.np_dtype)
     lbnd_a = np.zeros((nSamples, nSteps, nInst), dtype=val_world.np_dtype)
-    ubnd_a[:, :, 0] = 5.0  # spot upper bound
-    ubnd_a[:, :, 1] = 5.0  # option upper bound
-    lbnd_a[:, :, 0] = -5.0  # spot lower bound
-    lbnd_a[:, :, 1] = -5.0  # option lower bound
+    ubnd_a[:, :, 0] = 1.0  # spot upper bound
+    ubnd_a[:, :, 1] = 1.0  # option upper bound
+    lbnd_a[:, :, 0] = -1.0  # spot lower bound
+    lbnd_a[:, :, 1] = -1.0  # option lower bound
     
     # Time features
     time_left_values = np.array(unique_times, dtype=val_world.np_dtype)
@@ -208,7 +240,6 @@ def overwrite_world_with_csv(val_world, csv_path,
     # Prices for features
     prices = np.zeros((nSamples, nSteps, nInst), dtype=val_world.np_dtype)
     prices[:, :, 0] = spot_path[:, :nSteps]
-    prices[:, :, 1] = option_prices
     
     # Update world dimensions
     val_world.nSamples = nSamples
@@ -232,10 +263,6 @@ def overwrite_world_with_csv(val_world, csv_path,
     val_world.data.features.per_step.sqrt_time_left = sqrt_time_left_features
     val_world.data.features.per_step.spot = spot_path[:, :nSteps]
     val_world.data.features.per_step.ivol = ivols
-    val_world.data.features.per_step.call_price = option_prices
-    val_world.data.features.per_step.call_delta = option_deltas
-    val_world.data.features.per_step.call_vega = option_vegas
-    val_world.data.features.per_step.cost_v = cost[:, :, 1:2]
     
     # Update dummy dimension
     val_world.data.features.per_path[DIM_DUMMY] = (payoff * 0.)[:, np.newaxis]
@@ -266,7 +293,6 @@ def overwrite_world_with_csv(val_world, csv_path,
     print(f"Final dimensions: {nSamples} samples, {nSteps} steps, {nInst} instruments")
     
     return val_world
-
 
 def test_agent_with_csv(gym, world, csv_path, **kwargs):
     """
@@ -336,21 +362,45 @@ def test_agent_with_csv(gym, world, csv_path, **kwargs):
 
 # Example usage
 if __name__ == "__main__":
-    # Create sample CSV data for testing
-    sample_data = {
-        'strike': [57, 57, 57, 58, 58, 58, 59, 59],
-        'price': [57.69, 58.11, 57.32, 57.99, 58.98, 60.72, 58.03, 57.51],
-        'ivol': [0.4114, 0.4055, 0.3785, 0.3337, 0.3239, 0.3203, 0.3316, 0.3301],
-        'time_left': [21, 20, 19, 21, 20, 19, 21, 20],
-        'spot': [57.0, 57.0, 57.0, 57.0, 57.0, 57.0, 57.0, 57.0]
-    }
+    # Create sample CSV data for testing in the STRIPE format
+    sample_data = []
+    
+    # Create 3 stripes (paths) with 5 time steps each
+    stripes = ['2015-06-01', '2015-06-02', '2015-06-03']
+    strikes = [57.0, 58.0, 59.0]
+    
+    for i, (stripe, strike) in enumerate(zip(stripes, strikes)):
+        # Create time series for this stripe (path)
+        for j, time_left in enumerate([21, 20, 19, 18, 17]):
+            price = 3.0 - j * 0.4 + i * 0.2  # Decreasing price over time, different levels per stripe
+            ivol = 0.40 - j * 0.02 + i * 0.01  # Decreasing vol over time
+            
+            sample_data.append({
+                'stripe': stripe,
+                'strike': strike,
+                'price': price,
+                'ivol': ivol,
+                'time_left': time_left
+            })
     
     df = pd.DataFrame(sample_data)
     df.to_csv('sample_market_data.csv', index=False)
     print("Created sample CSV file: sample_market_data.csv")
-    print(df)
+    print("Sample data structure (STRIPE format):")
+    print(df.head(10))
     
-    print("\nTo use this script:")
-    print("1. Load your trained gym and world")
-    print("2. Call: results, val_world, stats = test_agent_with_csv(gym, world, 'your_data.csv')")
-    print("3. Or use overwrite_world_with_csv() directly for more control") 
+    print(f"\nData summary:")
+    print(f"- {len(stripes)} stripes (paths)")
+    print(f"- {len(df) // len(stripes)} time steps per stripe")
+    print(f"- Strikes: {strikes}")
+    
+    print("\nTo use this script with your data:")
+    print("1. Ensure your CSV has columns: STRIPE, STRIKE, Price, VOLATILITY, Time_to_Maturity")
+    print("2. Each STRIPE represents one path/sample")
+    print("3. Each path should have the same STRIKE throughout")
+    print("4. Call: results, val_world, stats = test_agent_with_csv(gym, world, 'your_data.csv')")
+    print("5. Or use overwrite_world_with_csv() directly for more control") 
+
+
+
+## 
